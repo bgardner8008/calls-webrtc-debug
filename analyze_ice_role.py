@@ -40,7 +40,7 @@ class LogParser:
         with open(log_file, 'r') as f:
             self.lines = f.readlines()
         self.has_timestamps = self._detect_timestamps()
-        self.client_ports = self._extract_client_ports()
+        self.client_endpoints = self._extract_client_endpoints()
 
     def _detect_timestamps(self) -> bool:
         """Detect if log file has Chrome console timestamps (HH:MM:SS.mmm format)"""
@@ -66,26 +66,39 @@ class LogParser:
             return dt.timestamp()
         return None
 
-    def _extract_client_ports(self) -> List[int]:
-        """Extract all client-side ports from ICE candidates in log
+    def _extract_client_endpoints(self) -> List[str]:
+        """Extract all client-side endpoints (IP:port) from ICE candidates in log
 
-        This handles multiple clients on same machine and ICE restarts.
-        Returns list of unique port numbers used by this client.
+        Only extracts LOCAL candidates (from onICECandidate), not remote candidates
+        (from handling remote signaling data). This ensures we only track STUN messages
+        for the specific client that generated this log file.
+
+        Returns list of unique "IP:port" strings used by this client.
         """
-        ports = set()
+        endpoints = set()
         for line in self.lines:
+            # Only process lines that contain LOCAL ICE candidates
+            # Skip lines with "handling remote signaling data" which are from the remote peer
+            if 'handling remote signaling data' in line or 'remote' in line.lower():
+                continue
+
+            # Look for local candidate indicators
+            if 'onICECandidate' not in line and 'local candidate' not in line and 'makeOffer' not in line and 'generated local answer' not in line:
+                continue
+
             # Match ICE candidate format: "candidate:... IP PORT typ TYPE..."
             # Example: "candidate:2138392041 1 udp 2121801471 172.16.0.11 65483 typ host..."
             matches = re.findall(r'candidate:\S+\s+\d+\s+\w+\s+\d+\s+([\d.]+)\s+(\d+)\s+typ\s+(\w+)', line)
             for ip, port, typ in matches:
                 # Only include host and srflx (server reflexive) candidates
-                # These represent the client's actual ports
-                if typ in ['host', 'srflx']:
-                    ports.add(int(port))
+                # These represent the client's actual endpoints
+                # Skip server port 8443 to avoid confusion
+                if typ in ['host', 'srflx'] and port != '8443':
+                    endpoints.add(f"{ip}:{port}")
 
-        result = sorted(ports)
+        result = sorted(endpoints)
         if result:
-            print(f"Detected client ports from log: {result}", file=sys.stderr)
+            print(f"Detected client endpoints from log: {result}", file=sys.stderr)
         return result
 
     def parse(self) -> List[Event]:
@@ -294,17 +307,27 @@ def extract_client_ips_from_server_log(log_file: str) -> List[str]:
 class TsharkPcapParser:
     """Parse pcap files using tshark for accurate STUN parsing"""
 
-    def __init__(self, pcap_file: str, client_ports: Optional[List[int]] = None,
+    def __init__(self, pcap_file: str, client_endpoints: Optional[List[str]] = None,
                  client_ips: Optional[List[str]] = None, server_ip: Optional[str] = None,
-                 server_port: int = 8443):
+                 server_port: int = 8443, selected_only: bool = False):
         self.pcap_file = pcap_file
         self.server_port = server_port
         self.server_ip = server_ip
         self.client_ips = client_ips or []
-        self.client_ports = client_ports or []
+        self.client_endpoints = client_endpoints or []
+        self.selected_only = selected_only
 
     def parse(self) -> List[Event]:
         events = []
+
+        # If selected_only mode, identify the most active endpoint first
+        if self.selected_only and self.client_endpoints:
+            selected_endpoint = self._find_selected_endpoint()
+            if selected_endpoint:
+                print(f"Selected candidate pair (most active): {selected_endpoint}", file=sys.stderr)
+                self.client_endpoints = [selected_endpoint]
+            else:
+                print("Warning: Could not identify selected candidate pair, showing all endpoints", file=sys.stderr)
 
         # Get STUN role messages
         events.extend(self._parse_stun_roles())
@@ -313,6 +336,74 @@ class TsharkPcapParser:
         events.extend(self._parse_stun_errors())
 
         return sorted(events, key=lambda e: e.timestamp or 0)
+
+    def _find_selected_endpoint(self) -> Optional[str]:
+        """Find the most active client endpoint based on UDP packet count
+
+        Counts all UDP packets (excluding STUN) to/from each client endpoint.
+        The endpoint with the most traffic is likely the selected candidate pair.
+        """
+        try:
+            # Build filter for all UDP packets to/from server port (excluding STUN)
+            # We want to count media/data packets, not STUN keepalives
+            udp_filter = f'udp.port == {self.server_port} and not stun'
+
+            cmd = [
+                '/usr/local/bin/tshark',
+                '-r', self.pcap_file,
+                '-Y', udp_filter,
+                '-T', 'fields',
+                '-e', 'ip.src',
+                '-e', 'ip.dst',
+                '-e', 'udp.srcport',
+                '-e', 'udp.dstport',
+                '-E', 'separator=|'
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                return None
+
+            # Count packets per client endpoint
+            endpoint_counts = {}
+
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+
+                parts = line.split('|')
+                if len(parts) < 4:
+                    continue
+
+                src_ip = parts[0]
+                dst_ip = parts[1]
+                src_port = parts[2]
+                dst_port = parts[3]
+
+                # Identify client endpoint (the non-8443 side)
+                if src_port == str(self.server_port):
+                    client_endpoint = f"{dst_ip}:{dst_port}"
+                elif dst_port == str(self.server_port):
+                    client_endpoint = f"{src_ip}:{src_port}"
+                else:
+                    continue
+
+                # Only count endpoints we're tracking
+                if client_endpoint in self.client_endpoints:
+                    endpoint_counts[client_endpoint] = endpoint_counts.get(client_endpoint, 0) + 1
+
+            # Return the endpoint with the most packets
+            if endpoint_counts:
+                selected = max(endpoint_counts.items(), key=lambda x: x[1])
+                print(f"UDP packet counts: {dict(sorted(endpoint_counts.items(), key=lambda x: x[1], reverse=True))}", file=sys.stderr)
+                return selected[0]
+
+            return None
+
+        except Exception as e:
+            print(f"Error finding selected endpoint: {e}", file=sys.stderr)
+            return None
 
     def _parse_stun_roles(self) -> List[Event]:
         """Parse STUN Binding Requests with ICE role attributes using tshark
@@ -330,17 +421,11 @@ class TsharkPcapParser:
             # stun.att.type == 0x802a = ICE-CONTROLLING attribute
             stun_filter = 'stun.type == 0x0001 and (stun.att.type == 0x8029 or stun.att.type == 0x802a)'
 
-            # Filter by client IPs if specified (more reliable than ports)
+            # Filter by client IPs if specified (for backwards compatibility with server logs)
             if self.client_ips:
                 ip_filters = [f'(ip.addr == {ip})' for ip in self.client_ips]
                 ip_filter = ' or '.join(ip_filters)
                 stun_filter = f'({stun_filter}) and ({ip_filter})'
-            # Otherwise fall back to client ports if specified
-            elif self.client_ports:
-                port_filters = [f'(udp.port == {port} and udp.port == {self.server_port})'
-                               for port in self.client_ports]
-                port_filter = ' or '.join(port_filters)
-                stun_filter = f'({stun_filter}) and ({port_filter})'
 
             cmd = [
                 '/usr/local/bin/tshark',
@@ -362,9 +447,13 @@ class TsharkPcapParser:
                 print(f"tshark error: {result.stderr}", file=sys.stderr)
                 return events
 
-            # Track roles to detect transitions
-            server_to_client_role = None
-            client_to_server_role = None
+            # Track roles per unique endpoint and direction
+            # The role attribute in STUN indicates the SENDER's role, so:
+            # - Client→Server messages show the client's role
+            # - Server→Client messages show the server's role
+            # We need to track these separately to avoid false transitions
+            client_roles = {}  # Key: endpoint, Value: client's current role
+            server_roles = {}  # Key: endpoint, Value: server's current role
 
             for line in result.stdout.strip().split('\n'):
                 if not line:
@@ -381,24 +470,45 @@ class TsharkPcapParser:
                 dst_port = parts[4]
                 att_types = parts[5]  # Comma-separated attribute types
 
-                # Determine direction
+                # Identify client and server endpoints based on port 8443
+                # Server is always at port 8443
                 if src_port == str(self.server_port):
                     direction = 'Server→Client'
-                    current_role_state = server_to_client_role
+                    sender = 'server'
+                    client_endpoint = f"{dst_ip}:{dst_port}"
+                    server_endpoint = f"{src_ip}:{src_port}"
                 elif dst_port == str(self.server_port):
                     direction = 'Client→Server'
-                    current_role_state = client_to_server_role
+                    sender = 'client'
+                    client_endpoint = f"{src_ip}:{src_port}"
+                    server_endpoint = f"{dst_ip}:{dst_port}"
                 else:
+                    continue
+
+                # Filter by client endpoints if specified (from log file ICE candidates)
+                # This filters out STUN messages to/from other clients
+                if self.client_endpoints and client_endpoint not in self.client_endpoints:
                     continue
 
                 # Determine role from attribute types (comma-separated)
                 # ICE-CONTROLLING = 0x802a, ICE-CONTROLLED = 0x8029
+                # The role attribute indicates the SENDER's role
                 if '0x802a' in att_types:
                     role = 'CONTROLLING'
                 elif '0x8029' in att_types:
                     role = 'CONTROLLED'
                 else:
                     continue
+
+                # Get current role state for the appropriate side
+                if sender == 'client':
+                    current_role_state = client_roles.get(client_endpoint)
+                    role_dict = client_roles
+                    side_label = 'Client'
+                else:  # sender == 'server'
+                    current_role_state = server_roles.get(client_endpoint)
+                    role_dict = server_roles
+                    side_label = 'Server'
 
                 # Check for initial or transition
                 if current_role_state is None:
@@ -407,12 +517,9 @@ class TsharkPcapParser:
                         source='PCAP',
                         direction=direction,
                         event_type='STUN_INITIAL',
-                        details=f"ICE role: {role}"
+                        details=f"{side_label} ICE role: {role} [{client_endpoint}]"
                     ))
-                    if direction == 'Server→Client':
-                        server_to_client_role = role
-                    else:
-                        client_to_server_role = role
+                    role_dict[client_endpoint] = role
 
                 elif current_role_state != role:
                     events.append(Event(
@@ -420,12 +527,9 @@ class TsharkPcapParser:
                         source='PCAP',
                         direction=direction,
                         event_type='STUN_TRANSITION',
-                        details=f"ICE role: {current_role_state} → {role}"
+                        details=f"{side_label} ICE role: {current_role_state} → {role} [{client_endpoint}]"
                     ))
-                    if direction == 'Server→Client':
-                        server_to_client_role = role
-                    else:
-                        client_to_server_role = role
+                    role_dict[client_endpoint] = role
 
         except Exception as e:
             print(f"Error parsing STUN roles: {e}", file=sys.stderr)
@@ -440,17 +544,11 @@ class TsharkPcapParser:
             # Build filter for STUN error 487
             error_filter = 'stun.att.error == 87'
 
-            # Filter by client IPs if specified (more reliable than ports)
+            # Filter by client IPs if specified (for backwards compatibility with server logs)
             if self.client_ips:
                 ip_filters = [f'(ip.addr == {ip})' for ip in self.client_ips]
                 ip_filter = ' or '.join(ip_filters)
                 error_filter = f'({error_filter}) and ({ip_filter})'
-            # Otherwise fall back to client ports if specified
-            elif self.client_ports:
-                port_filters = [f'(udp.port == {port} and udp.port == {self.server_port})'
-                               for port in self.client_ports]
-                port_filter = ' or '.join(port_filters)
-                error_filter = f'({error_filter}) and ({port_filter})'
 
             cmd = [
                 '/usr/local/bin/tshark',
@@ -489,20 +587,27 @@ class TsharkPcapParser:
                 error_code = parts[5]
                 error_reason = parts[6] if len(parts) > 6 else ''
 
-                # Determine direction
+                # Identify client and server endpoints based on port 8443
                 if src_port == str(self.server_port):
                     direction = 'Server→Client'
+                    client_endpoint = f"{dst_ip}:{dst_port}"
                 elif dst_port == str(self.server_port):
                     direction = 'Client→Server'
+                    client_endpoint = f"{src_ip}:{src_port}"
                 else:
                     direction = 'Unknown'
+                    client_endpoint = f"{src_ip}:{src_port}"
+
+                # Filter by client endpoints if specified (from log file ICE candidates)
+                if self.client_endpoints and client_endpoint not in self.client_endpoints:
+                    continue
 
                 events.append(Event(
                     timestamp=timestamp,
                     source='PCAP',
                     direction=direction,
                     event_type='STUN_ERROR_487',
-                    details=f'Role Conflict Error'
+                    details=f'Role Conflict Error [{client_endpoint}]'
                 ))
 
         except Exception as e:
@@ -515,12 +620,13 @@ class CallAnalyzer:
 
     def __init__(self, log_file: Optional[str] = None, pcap_file: Optional[str] = None,
                  client_ips: Optional[List[str]] = None, server_ip: Optional[str] = None,
-                 server_port: int = 8443):
+                 server_port: int = 8443, selected_only: bool = False):
         self.log_file = log_file
         self.pcap_file = pcap_file
         self.client_ips = client_ips
         self.server_ip = server_ip
         self.server_port = server_port
+        self.selected_only = selected_only
         self.log_parser = None
         self.pcap_parser = None
 
@@ -530,20 +636,21 @@ class CallAnalyzer:
 
         # Parse PCAP first to get reference date for log timestamps
         reference_date = None
-        client_ports = []
+        client_endpoints = []
 
         if self.log_file:
-            # Create initial log parser to extract client ports
+            # Create initial log parser to extract client endpoints
             temp_log_parser = LogParser(self.log_file)
-            client_ports = temp_log_parser.client_ports
+            client_endpoints = temp_log_parser._extract_client_endpoints()
 
         if self.pcap_file:
             self.pcap_parser = TsharkPcapParser(
                 self.pcap_file,
-                client_ports=client_ports,
+                client_endpoints=client_endpoints,
                 client_ips=self.client_ips,
                 server_ip=self.server_ip,
-                server_port=self.server_port
+                server_port=self.server_port,
+                selected_only=self.selected_only
             )
             pcap_events = self.pcap_parser.parse()
 
@@ -581,6 +688,8 @@ Examples:
     parser.add_argument('--server-log', type=str, help='Server log file (Pion ICE logs) - used to auto-detect client IPs')
     parser.add_argument('--server-ip', type=str, help='Server IP address (auto-detected from pcap if not specified)')
     parser.add_argument('--server-port', type=int, default=8443, help='Server port (default: 8443)')
+    parser.add_argument('--selected-only', action='store_true',
+                       help='Only show the selected candidate pair (most active endpoint based on UDP traffic)')
 
     args = parser.parse_args()
 
@@ -614,7 +723,8 @@ Examples:
         pcap_file=args.pcap,
         client_ips=client_ips if client_ips else None,
         server_ip=args.server_ip,
-        server_port=args.server_port
+        server_port=args.server_port,
+        selected_only=args.selected_only
     )
     log_events, pcap_events = analyzer.analyze()
 
