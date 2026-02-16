@@ -138,7 +138,7 @@ def export_pcap_to_json(pcap_file: str) -> str:
 
     # Run tshark to export STUN packets
     cmd = [
-        'tshark',
+        '/usr/local/bin/tshark',
         '-r', pcap_file,
         '-Y', 'stun',
         '-T', 'json'
@@ -172,7 +172,22 @@ def parse_json_packets(json_file: str, server_ip: Optional[str] = None) -> List[
             stun = layers.get('stun', {})
 
             # Extract basic packet info
-            timestamp = float(frame['frame.time_epoch'])
+            # Handle both epoch float and ISO timestamp string
+            time_epoch = frame.get('frame.time_epoch', frame.get('frame.time'))
+            try:
+                timestamp = float(time_epoch)
+            except (ValueError, TypeError):
+                # Parse ISO timestamp (e.g., "2026-02-15T22:33:57.429541000Z")
+                # Remove 'Z' suffix and handle nanosecond precision
+                time_str = str(time_epoch).rstrip('Z')
+                # Python datetime only handles microseconds, truncate nanoseconds
+                if '.' in time_str:
+                    base, frac = time_str.split('.')
+                    frac = frac[:6]  # Keep only microseconds
+                    time_str = f"{base}.{frac}"
+                dt = datetime.fromisoformat(time_str)
+                timestamp = dt.timestamp()
+
             frame_num = frame['frame.number']
             src_ip = ip['ip.src']
             dst_ip = ip['ip.dst']
@@ -307,19 +322,96 @@ def validate_rfc8445(messages: List[STUNMessage], server_ip: str) -> Dict:
 
             # Detect role conflicts
             if client_role and server_role and client_role == server_role:
+                # Determine who should send 487 based on RFC 8445 Section 7.3.1.1
+                # The logic differs depending on which role both agents are in:
+                should_send_487 = None
+                if results['client_tie_breaker'] and results['server_tie_breaker']:
+                    if client_role == 'CONTROLLING':
+                        # Both CONTROLLING: Agent with higher/equal tie-breaker sends 487
+                        if results['client_tie_breaker'] >= results['server_tie_breaker']:
+                            should_send_487 = 'client'
+                        else:
+                            should_send_487 = 'server'
+                    else:  # Both CONTROLLED
+                        # Both CONTROLLED: Agent with lower tie-breaker sends 487
+                        if results['client_tie_breaker'] < results['server_tie_breaker']:
+                            should_send_487 = 'client'
+                        else:
+                            should_send_487 = 'server'
+
                 results['conflicts'].append({
                     'timestamp': msg.timestamp,
                     'frame': msg.frame_num,
                     'role': client_role,
                     'client_tie_breaker': results['client_tie_breaker'],
                     'server_tie_breaker': results['server_tie_breaker'],
-                    'direction': direction
+                    'direction': direction,
+                    'should_send_487': should_send_487
                 })
 
-    # Find 487 errors
+    # Find 487 errors and categorize by direction
     error_487_messages = [m for m in messages if m.is_error_response() and m.error_code == 487]
     results['error_487_count'] = len(error_487_messages)
     results['error_487_messages'] = error_487_messages
+
+    # Count 487s by direction
+    server_487_count = sum(1 for m in error_487_messages if m.src_ip == server_ip)
+    client_487_count = sum(1 for m in error_487_messages if m.src_ip != server_ip)
+
+    # Count required 487s by side
+    server_should_send_487 = sum(1 for c in results['conflicts'] if c['should_send_487'] == 'server')
+    client_should_send_487 = sum(1 for c in results['conflicts'] if c['should_send_487'] == 'client')
+
+    # Detect missing 487 responses as RFC violations
+    if server_should_send_487 > server_487_count:
+        missing = server_should_send_487 - server_487_count
+        results['violations'].append({
+            'type': 'MISSING_487_RESPONSE',
+            'endpoint': 'server',
+            'message': f"Server failed to send {missing} required 487 error responses ({server_487_count} sent, {server_should_send_487} required)",
+            'required': server_should_send_487,
+            'actual': server_487_count,
+            'missing': missing
+        })
+
+    if client_should_send_487 > client_487_count:
+        missing = client_should_send_487 - client_487_count
+        results['violations'].append({
+            'type': 'MISSING_487_RESPONSE',
+            'endpoint': 'client',
+            'message': f"Client failed to send {missing} required 487 error responses ({client_487_count} sent, {client_should_send_487} required)",
+            'required': client_should_send_487,
+            'actual': client_487_count,
+            'missing': missing
+        })
+
+    # Check for improper role switches after sending 487 errors
+    # RFC 8445: Only switch role when RECEIVING 487, not when SENDING it
+    for err_msg in error_487_messages:
+        err_sender_is_server = err_msg.src_ip == server_ip
+        err_timestamp = err_msg.timestamp
+
+        # Look for role switches by the sender within 1 second of sending the 487
+        for switch in results['role_switches']:
+            switch_is_server = switch['endpoint'] == 'server'
+
+            # Check if the switch is by the same endpoint that sent the 487
+            if err_sender_is_server == switch_is_server:
+                time_diff = abs(switch['timestamp'] - err_timestamp)
+
+                # If role switch happens within 1 second of sending 487, it's likely a violation
+                if time_diff < 1.0:
+                    endpoint = 'server' if err_sender_is_server else 'client'
+                    results['violations'].append({
+                        'type': 'IMPROPER_ROLE_SWITCH_AFTER_SENDING_487',
+                        'endpoint': endpoint,
+                        'message': f"{endpoint.capitalize()} switched roles {time_diff*1000:.1f}ms after sending 487 error (frame {err_msg.frame_num}). Per RFC 8445, agent should only switch when RECEIVING 487, not when SENDING it.",
+                        'error_frame': err_msg.frame_num,
+                        'error_timestamp': err_timestamp,
+                        'switch_frame': switch['frame'],
+                        'switch_timestamp': switch['timestamp'],
+                        'time_diff_ms': time_diff * 1000
+                    })
 
     return results
 
@@ -362,11 +454,24 @@ def print_results(results: Dict, messages: List[STUNMessage], server_ip: str):
 
     # Violations
     if results['violations']:
-        print("\n## ⚠️  VIOLATIONS")
+        print("\n## ⚠️  RFC 8445 VIOLATIONS DETECTED")
         for v in results['violations']:
-            ts = datetime.fromtimestamp(v['timestamp']).strftime('%H:%M:%S.%f')[:-3]
-            print(f"\n❌ Frame {v['frame']} @ {ts}")
-            print(f"   {v['message']}")
+            if v['type'] == 'TIE_BREAKER_CHANGED':
+                ts = datetime.fromtimestamp(v['timestamp']).strftime('%H:%M:%S.%f')[:-3]
+                print(f"\n❌ Frame {v['frame']} @ {ts}")
+                print(f"   {v['message']}")
+            elif v['type'] == 'MISSING_487_RESPONSE':
+                print(f"\n❌ {v['endpoint'].upper()} RFC 8445 Section 7.3.1.1 Violation:")
+                print(f"   {v['message']}")
+                print(f"   Required: {v['required']} | Actual: {v['actual']} | Missing: {v['missing']}")
+            elif v['type'] == 'IMPROPER_ROLE_SWITCH_AFTER_SENDING_487':
+                err_ts = datetime.fromtimestamp(v['error_timestamp']).strftime('%H:%M:%S.%f')[:-3]
+                switch_ts = datetime.fromtimestamp(v['switch_timestamp']).strftime('%H:%M:%S.%f')[:-3]
+                print(f"\n❌ {v['endpoint'].upper()} RFC 8445 Section 7.3.1.1 Violation:")
+                print(f"   {v['message']}")
+                print(f"   Sent 487 at {err_ts} (frame {v['error_frame']})")
+                print(f"   Switched role at {switch_ts} (frame {v['switch_frame']})")
+                print(f"   Time difference: {v['time_diff_ms']:.1f}ms")
     else:
         print("\n## ✅ No RFC violations detected")
 
@@ -381,19 +486,43 @@ def print_results(results: Dict, messages: List[STUNMessage], server_ip: str):
     # Conflicts
     if results['conflicts']:
         print("\n## Role Conflicts Detected")
-        for conflict in results['conflicts']:
+        print(f"\nTotal conflicts: {len(results['conflicts'])}")
+
+        # Show summary of who should send 487s
+        server_should_send = sum(1 for c in results['conflicts'] if c.get('should_send_487') == 'server')
+        client_should_send = sum(1 for c in results['conflicts'] if c.get('should_send_487') == 'client')
+
+        if server_should_send > 0:
+            print(f"Server should send 487: {server_should_send} conflicts")
+        if client_should_send > 0:
+            print(f"Client should send 487: {client_should_send} conflicts")
+
+        # Only show first 10 conflicts in detail to avoid overwhelming output
+        print(f"\nShowing first 10 conflicts (use script to see all):")
+        for conflict in results['conflicts'][:10]:
             ts = datetime.fromtimestamp(conflict['timestamp']).strftime('%H:%M:%S.%f')[:-3]
             print(f"\n⚠️  Frame {conflict['frame']} @ {ts}")
             print(f"   Both sides in {conflict['role']} role")
             print(f"   Client tie-breaker: {conflict['client_tie_breaker']}")
             print(f"   Server tie-breaker: {conflict['server_tie_breaker']}")
 
-            # RFC 8445: side with larger/equal tie-breaker should send 487
+            # RFC 8445 Section 7.3.1.1: Logic depends on role
             if conflict['client_tie_breaker'] and conflict['server_tie_breaker']:
-                if conflict['client_tie_breaker'] >= conflict['server_tie_breaker']:
-                    print(f"   RFC 8445: Client should send 487 (client >= server)")
-                else:
-                    print(f"   RFC 8445: Server should send 487 (server > client)")
+                if conflict['role'] == 'CONTROLLING':
+                    # Both CONTROLLING: higher/equal tie-breaker sends 487
+                    if conflict['client_tie_breaker'] >= conflict['server_tie_breaker']:
+                        print(f"   RFC 8445: Client should send 487 (both CONTROLLING, client >= server)")
+                    else:
+                        print(f"   RFC 8445: Server should send 487 (both CONTROLLING, server > client)")
+                else:  # Both CONTROLLED
+                    # Both CONTROLLED: lower tie-breaker sends 487
+                    if conflict['client_tie_breaker'] < conflict['server_tie_breaker']:
+                        print(f"   RFC 8445: Client should send 487 (both CONTROLLED, client < server)")
+                    else:
+                        print(f"   RFC 8445: Server should send 487 (both CONTROLLED, server <= client)")
+
+        if len(results['conflicts']) > 10:
+            print(f"\n... and {len(results['conflicts']) - 10} more conflicts")
 
     # 487 Errors
     if results['error_487_messages']:
