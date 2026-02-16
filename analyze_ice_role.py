@@ -89,6 +89,7 @@ class LogParser:
         return result
 
     def parse(self) -> List[Event]:
+        """Parse log file for WebRTC events"""
         events = []
 
         for line_num, line in enumerate(self.lines, 1):
@@ -96,7 +97,7 @@ class LogParser:
                 event = self._parse_sdp_remote(line, line_num)
                 if event:
                     events.append(event)
-            elif 'RTCPeer.signal: sending' in line or 'makeOffer' in line:
+            elif 'RTCPeer.signal: sending' in line or 'makeOffer' in line or 'generated local answer' in line:
                 event = self._parse_sdp_local(line, line_num)
                 if event:
                     events.append(event)
@@ -185,14 +186,37 @@ class LogParser:
                 details=details,
                 raw_data={'line_num': line_num, 'setup': setup, 'ufrag': ufrag}
             )
-        elif 'sending answer' in line:
+        elif 'generated local answer' in line:
+            # Parse the actual answer SDP from JSON
+            setup = 'passive'
+            ufrag = None
+            json_match = re.search(r'\{"type":"answer"', line)
+            if json_match:
+                try:
+                    import json
+                    json_str = line[json_match.start():].split('\n')[0].rstrip()
+                    data = json.loads(json_str)
+                    sdp = data.get('sdp', '')
+
+                    setup_match = re.search(r'a=setup:(\w+)', sdp)
+                    setup = setup_match.group(1) if setup_match else 'passive'
+
+                    ufrag_match = re.search(r'a=ice-ufrag:(\S+)', sdp)
+                    ufrag = ufrag_match.group(1) if ufrag_match else None
+                except:
+                    pass
+
+            details = f"setup:{setup}"
+            if ufrag:
+                details += f" ufrag:{ufrag[:8]}..."
+
             return Event(
                 timestamp=timestamp,
                 source='LOG',
                 direction='Client→Server',
                 event_type='SDP_ANSWER',
-                details='setup:passive (typical)',
-                raw_data={'line_num': line_num}
+                details=details,
+                raw_data={'line_num': line_num, 'setup': setup, 'ufrag': ufrag}
             )
         return None
 
@@ -228,12 +252,55 @@ class LogParser:
             )
         return None
 
+
+def extract_client_ips_from_server_log(log_file: str) -> List[str]:
+    """Extract client IP addresses from Pion ICE server logs
+
+    Looks for patterns like:
+    - "Found valid candidate pair: ... -> IP:PORT"
+    - "Inbound STUN (Request) from IP:PORT"
+    - "Set selected pair: ... -> IP:PORT"
+
+    Returns list of unique client IP addresses found in the logs.
+    """
+    ips = set()
+
+    with open(log_file, 'r') as f:
+        for line in f:
+            # Match candidate pair logs: "... -> IP:PORT" or "... from IP:PORT"
+            # Example: "Found valid candidate pair: 192.168.64.1:8443 -> 192.168.64.1:61775"
+            # Example: "Inbound STUN (Request) from 127.0.0.1:56789 to 127.0.0.1:8443"
+
+            # Pattern 1: "-> IP:PORT" (remote candidate in pair)
+            matches = re.findall(r'->\s*([\d.]+):\d+', line)
+            ips.update(matches)
+
+            # Pattern 2: "from IP:PORT" (STUN messages)
+            matches = re.findall(r'from\s+([\d.]+):\d+', line)
+            ips.update(matches)
+
+            # Pattern 3: ICE candidate parsing - extract IPs that aren't 127.0.0.1 or 0.0.0.0
+            matches = re.findall(r'candidate:\S+\s+\d+\s+\w+\s+\d+\s+([\d.]+)\s+\d+\s+typ', line)
+            for ip in matches:
+                if ip not in ['127.0.0.1', '0.0.0.0']:
+                    ips.add(ip)
+
+    result = sorted(ips)
+    if result:
+        print(f"Extracted client IPs from server log: {result}", file=sys.stderr)
+    return result
+
+
 class TsharkPcapParser:
     """Parse pcap files using tshark for accurate STUN parsing"""
 
-    def __init__(self, pcap_file: str, client_ports: Optional[List[int]] = None):
+    def __init__(self, pcap_file: str, client_ports: Optional[List[int]] = None,
+                 client_ips: Optional[List[str]] = None, server_ip: Optional[str] = None,
+                 server_port: int = 8443):
         self.pcap_file = pcap_file
-        self.server_port = 8443
+        self.server_port = server_port
+        self.server_ip = server_ip
+        self.client_ips = client_ips or []
         self.client_ports = client_ports or []
 
     def parse(self) -> List[Event]:
@@ -263,8 +330,13 @@ class TsharkPcapParser:
             # stun.att.type == 0x802a = ICE-CONTROLLING attribute
             stun_filter = 'stun.type == 0x0001 and (stun.att.type == 0x8029 or stun.att.type == 0x802a)'
 
-            # If client ports specified, filter to only those ports communicating with server
-            if self.client_ports:
+            # Filter by client IPs if specified (more reliable than ports)
+            if self.client_ips:
+                ip_filters = [f'(ip.addr == {ip})' for ip in self.client_ips]
+                ip_filter = ' or '.join(ip_filters)
+                stun_filter = f'({stun_filter}) and ({ip_filter})'
+            # Otherwise fall back to client ports if specified
+            elif self.client_ports:
                 port_filters = [f'(udp.port == {port} and udp.port == {self.server_port})'
                                for port in self.client_ports]
                 port_filter = ' or '.join(port_filters)
@@ -368,8 +440,13 @@ class TsharkPcapParser:
             # Build filter for STUN error 487
             error_filter = 'stun.att.error == 87'
 
-            # If client ports specified, filter to only those ports
-            if self.client_ports:
+            # Filter by client IPs if specified (more reliable than ports)
+            if self.client_ips:
+                ip_filters = [f'(ip.addr == {ip})' for ip in self.client_ips]
+                ip_filter = ' or '.join(ip_filters)
+                error_filter = f'({error_filter}) and ({ip_filter})'
+            # Otherwise fall back to client ports if specified
+            elif self.client_ports:
                 port_filters = [f'(udp.port == {port} and udp.port == {self.server_port})'
                                for port in self.client_ports]
                 port_filter = ' or '.join(port_filters)
@@ -436,9 +513,14 @@ class TsharkPcapParser:
 class CallAnalyzer:
     """Correlate log and pcap events into unified timeline"""
 
-    def __init__(self, log_file: Optional[str] = None, pcap_file: Optional[str] = None):
+    def __init__(self, log_file: Optional[str] = None, pcap_file: Optional[str] = None,
+                 client_ips: Optional[List[str]] = None, server_ip: Optional[str] = None,
+                 server_port: int = 8443):
         self.log_file = log_file
         self.pcap_file = pcap_file
+        self.client_ips = client_ips
+        self.server_ip = server_ip
+        self.server_port = server_port
         self.log_parser = None
         self.pcap_parser = None
 
@@ -456,7 +538,13 @@ class CallAnalyzer:
             client_ports = temp_log_parser.client_ports
 
         if self.pcap_file:
-            self.pcap_parser = TsharkPcapParser(self.pcap_file, client_ports)
+            self.pcap_parser = TsharkPcapParser(
+                self.pcap_file,
+                client_ports=client_ports,
+                client_ips=self.client_ips,
+                server_ip=self.server_ip,
+                server_port=self.server_port
+            )
             pcap_events = self.pcap_parser.parse()
 
             # Extract reference date from first PCAP event
@@ -485,16 +573,29 @@ Examples:
   %(prog)s --log call3.log --pcap call3.pcap    # Analyze both
   %(prog)s --log call3.log                       # Analyze log only
   %(prog)s --pcap call3.pcap                     # Analyze pcap only
+  %(prog)s --pcap call.pcap --server-log server.log  # Auto-detect client IPs from server log
         '''
     )
-    parser.add_argument('--log', type=str, help='Browser console log file')
+    parser.add_argument('--log', type=str, help='Browser console log file (client-side)')
     parser.add_argument('--pcap', type=str, help='Packet capture file')
+    parser.add_argument('--server-log', type=str, help='Server log file (Pion ICE logs) - used to auto-detect client IPs')
+    parser.add_argument('--server-ip', type=str, help='Server IP address (auto-detected from pcap if not specified)')
+    parser.add_argument('--server-port', type=int, default=8443, help='Server port (default: 8443)')
 
     args = parser.parse_args()
 
     # Require at least one input
     if not args.log and not args.pcap:
         parser.error("At least one of --log or --pcap is required")
+
+    # Extract client IPs from server log if provided
+    client_ips = []
+    if args.server_log:
+        client_ips = extract_client_ips_from_server_log(args.server_log)
+        if client_ips:
+            print(f"Auto-detected client IPs: {client_ips}", file=sys.stderr)
+            print(f"Will filter STUN packets to/from these IPs", file=sys.stderr)
+            print()
 
     # Print header
     files = []
@@ -508,7 +609,13 @@ Examples:
     print()
 
     # Analyze
-    analyzer = CallAnalyzer(log_file=args.log, pcap_file=args.pcap)
+    analyzer = CallAnalyzer(
+        log_file=args.log,
+        pcap_file=args.pcap,
+        client_ips=client_ips if client_ips else None,
+        server_ip=args.server_ip,
+        server_port=args.server_port
+    )
     log_events, pcap_events = analyzer.analyze()
 
     # Check if log events have timestamps
