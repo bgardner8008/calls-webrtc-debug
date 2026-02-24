@@ -132,8 +132,10 @@ class LogParser:
                 return None
 
             import json
-            json_str = line[json_match.start():].split('\n')[0].rstrip()
-            data = json.loads(json_str)
+            # Use raw_decode to parse just the JSON object, ignoring extra text after
+            json_str = line[json_match.start():]
+            decoder = json.JSONDecoder()
+            data, end_idx = decoder.raw_decode(json_str)
             sdp_type = data.get('type', 'unknown')
             sdp = data.get('sdp', '')
 
@@ -175,8 +177,10 @@ class LogParser:
             if json_match:
                 try:
                     import json
-                    json_str = line[json_match.start():].split('\n')[0].rstrip()
-                    data = json.loads(json_str)
+                    # Use raw_decode to parse just the JSON object
+                    json_str = line[json_match.start():]
+                    decoder = json.JSONDecoder()
+                    data, end_idx = decoder.raw_decode(json_str)
                     sdp = data.get('sdp', '')
 
                     setup_match = re.search(r'a=setup:(\w+)', sdp)
@@ -207,8 +211,10 @@ class LogParser:
             if json_match:
                 try:
                     import json
-                    json_str = line[json_match.start():].split('\n')[0].rstrip()
-                    data = json.loads(json_str)
+                    # Use raw_decode to parse just the JSON object
+                    json_str = line[json_match.start():]
+                    decoder = json.JSONDecoder()
+                    data, end_idx = decoder.raw_decode(json_str)
                     sdp = data.get('sdp', '')
 
                     setup_match = re.search(r'a=setup:(\w+)', sdp)
@@ -390,8 +396,20 @@ class TsharkPcapParser:
                     continue
 
                 # Only count endpoints we're tracking
+                # Handle mDNS/privacy mode by matching port if exact endpoint doesn't match
+                matched_endpoint = None
                 if client_endpoint in self.client_endpoints:
-                    endpoint_counts[client_endpoint] = endpoint_counts.get(client_endpoint, 0) + 1
+                    matched_endpoint = client_endpoint
+                else:
+                    # Try matching by port only (for mDNS/NAT scenarios)
+                    client_port = client_endpoint.split(':')[1]
+                    for ep in self.client_endpoints:
+                        if ep.endswith(f':{client_port}'):
+                            matched_endpoint = ep
+                            break
+
+                if matched_endpoint:
+                    endpoint_counts[matched_endpoint] = endpoint_counts.get(matched_endpoint, 0) + 1
 
             # Return the endpoint with the most packets
             if endpoint_counts:
@@ -487,8 +505,15 @@ class TsharkPcapParser:
 
                 # Filter by client endpoints if specified (from log file ICE candidates)
                 # This filters out STUN messages to/from other clients
-                if self.client_endpoints and client_endpoint not in self.client_endpoints:
-                    continue
+                # Handle mDNS/privacy mode where IP addresses may not match but ports do
+                if self.client_endpoints:
+                    # Try exact match first
+                    if client_endpoint not in self.client_endpoints:
+                        # Try matching by port only (for mDNS/NAT scenarios)
+                        client_port = client_endpoint.split(':')[1]
+                        port_match = any(ep.endswith(f':{client_port}') for ep in self.client_endpoints)
+                        if not port_match:
+                            continue
 
                 # Determine role from attribute types (comma-separated)
                 # ICE-CONTROLLING = 0x802a, ICE-CONTROLLED = 0x8029
@@ -599,8 +624,14 @@ class TsharkPcapParser:
                     client_endpoint = f"{src_ip}:{src_port}"
 
                 # Filter by client endpoints if specified (from log file ICE candidates)
-                if self.client_endpoints and client_endpoint not in self.client_endpoints:
-                    continue
+                # Handle mDNS/privacy mode where IP addresses may not match but ports do
+                if self.client_endpoints:
+                    if client_endpoint not in self.client_endpoints:
+                        # Try matching by port only (for mDNS/NAT scenarios)
+                        client_port = client_endpoint.split(':')[1]
+                        port_match = any(ep.endswith(f':{client_port}') for ep in self.client_endpoints)
+                        if not port_match:
+                            continue
 
                 events.append(Event(
                     timestamp=timestamp,
@@ -790,11 +821,51 @@ Examples:
         if args.pcap:
             print(f"STUN errors: {len(stun_errors)}")
 
+        if args.pcap:
+            print()
+            print(f"ICE role conflict outcome: {_determine_conflict_outcome(pcap_events)}")
+
         if stun_errors and args.pcap:
             print()
             print("STUN Error Details:")
             for err in stun_errors:
                 print(f"  - {err.direction} at {datetime.fromtimestamp(err.timestamp).strftime('%H:%M:%S.%f')[:-3]}: {err.details}")
+
+def _determine_conflict_outcome(pcap_events: List[Event]) -> str:
+    """Determine ICE role conflict resolution outcome from PCAP events.
+
+    Five possible outcomes:
+    1. No conflicts detected - roles stable, no transitions or 487s seen
+    2. Client self-corrected - client changed role without being prompted by a server 487
+    3. Client sent 487 - client sent Role Conflict error response to server
+    4. Server self-corrected - server changed role without being prompted by a client 487
+    5. Server sent 487 - server sent Role Conflict error response to client
+    """
+    client_transitions = [e for e in pcap_events
+                          if e.event_type == 'STUN_TRANSITION' and e.direction == 'Client→Server']
+    server_transitions = [e for e in pcap_events
+                          if e.event_type == 'STUN_TRANSITION' and e.direction == 'Server→Client']
+    client_487 = [e for e in pcap_events
+                  if e.event_type == 'STUN_ERROR_487' and e.direction == 'Client→Server']
+    server_487 = [e for e in pcap_events
+                  if e.event_type == 'STUN_ERROR_487' and e.direction == 'Server→Client']
+
+    if not (client_transitions or server_transitions or client_487 or server_487):
+        return "No conflicts detected"
+
+    outcomes = []
+
+    if client_487:
+        outcomes.append("Client sent 487")
+    if server_487:
+        outcomes.append("Server sent 487")
+    if client_transitions:
+        outcomes.append("Client changed role")
+    if server_transitions:
+        outcomes.append("Server changed role")
+
+    return ", ".join(outcomes)
+
 
 if __name__ == '__main__':
     main()
